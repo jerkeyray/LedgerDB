@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -25,6 +26,7 @@ const (
 type checkpointData struct {
 	Version     uint16                      `json:"version"`
 	BaseLSN     uint64                      `json:"base_lsn"`
+	Holds       []Hold                      `json:"holds,omitempty"`
 	Accounts    []accountState              `json:"accounts"`
 	Idempotency map[string]idempotencyEntry `json:"idempotency"`
 }
@@ -36,7 +38,23 @@ type manifestData struct {
 }
 
 // Checkpoint publishes a fuzzy state snapshot and compacts covered WAL segments.
-func (db *DB) Checkpoint(ctx context.Context) error {
+func (db *DB) Checkpoint(ctx context.Context) (retErr error) {
+	var baseLSN uint64
+	db.metrics.checkpointMu.Lock()
+	db.metrics.checkpointAttempts++
+	db.metrics.checkpointMu.Unlock()
+	defer func() {
+		db.metrics.checkpointMu.Lock()
+		defer db.metrics.checkpointMu.Unlock()
+		if retErr != nil {
+			db.metrics.checkpointError = retErr.Error()
+		} else {
+			db.metrics.checkpointSuccesses++
+			db.metrics.checkpointLSN = baseLSN
+			db.metrics.checkpointTime = time.Now()
+			db.metrics.checkpointError = ""
+		}
+	}()
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
@@ -47,10 +65,10 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	}
 
 	db.commitMu.Lock()
-	baseLSN := db.nextLSN
+	baseLSN = db.nextLSN
 	db.commitMu.Unlock()
 
-	snapshot := checkpointData{Version: 1, BaseLSN: baseLSN, Idempotency: make(map[string]idempotencyEntry)}
+	snapshot := checkpointData{Version: 2, BaseLSN: baseLSN, Idempotency: make(map[string]idempotencyEntry)}
 	for i := range db.accounts {
 		if err := checkContext(ctx); err != nil {
 			return err
@@ -62,6 +80,12 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 		}
 		shard.RUnlock()
 	}
+	db.holdsMu.RLock()
+	for _, hold := range db.holds {
+		snapshot.Holds = append(snapshot.Holds, hold)
+	}
+	db.holdsMu.RUnlock()
+	sort.Slice(snapshot.Holds, func(i, j int) bool { return snapshot.Holds[i].ID < snapshot.Holds[j].ID })
 	for i := range db.idem {
 		if err := checkContext(ctx); err != nil {
 			return err
@@ -90,7 +114,7 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	if err := db.publishFile(finalPath, encoded); err != nil {
 		return fmt.Errorf("ledgerdb: publish checkpoint: %w", err)
 	}
-	manifest := manifestData{Version: 1, Checkpoint: filepath.Base(finalPath), BaseLSN: baseLSN}
+	manifest := manifestData{Version: 2, Checkpoint: filepath.Base(finalPath), BaseLSN: baseLSN}
 	manifestBytes, err := encodeEnvelope("LDBM", manifest)
 	if err != nil {
 		return err
@@ -110,7 +134,7 @@ func (db *DB) loadCheckpoint() (uint64, error) {
 	manifestBytes, err := db.fs.ReadFile(filepath.Join(db.dir, manifestName))
 	if err == nil {
 		var manifest manifestData
-		if decodeEnvelope(manifestBytes, "LDBM", &manifest) != nil || manifest.Version != 1 || filepath.Base(manifest.Checkpoint) != manifest.Checkpoint {
+		if decodeEnvelope(manifestBytes, "LDBM", &manifest) != nil || (manifest.Version != 1 && manifest.Version != 2) || filepath.Base(manifest.Checkpoint) != manifest.Checkpoint {
 			return 0, fmt.Errorf("%w: invalid manifest", ErrCorrupt)
 		}
 		data, readErr := db.fs.ReadFile(filepath.Join(db.dir, manifest.Checkpoint))
@@ -118,7 +142,7 @@ func (db *DB) loadCheckpoint() (uint64, error) {
 			return 0, fmt.Errorf("%w: manifest checkpoint: %v", ErrCorrupt, readErr)
 		}
 		var snapshot checkpointData
-		if decodeEnvelope(data, checkpointMagic, &snapshot) != nil || snapshot.Version != 1 || snapshot.BaseLSN != manifest.BaseLSN {
+		if decodeEnvelope(data, checkpointMagic, &snapshot) != nil || (snapshot.Version != 1 && snapshot.Version != 2) || snapshot.BaseLSN != manifest.BaseLSN {
 			return 0, fmt.Errorf("%w: invalid manifest checkpoint", ErrCorrupt)
 		}
 		db.installCheckpoint(snapshot)
@@ -149,7 +173,7 @@ func (db *DB) loadCheckpoint() (uint64, error) {
 			continue
 		}
 		var snapshot checkpointData
-		if decodeEnvelope(data, checkpointMagic, &snapshot) != nil || snapshot.Version != 1 {
+		if decodeEnvelope(data, checkpointMagic, &snapshot) != nil || (snapshot.Version != 1 && snapshot.Version != 2) {
 			continue
 		}
 		db.installCheckpoint(snapshot)
@@ -159,6 +183,9 @@ func (db *DB) loadCheckpoint() (uint64, error) {
 }
 
 func (db *DB) installCheckpoint(snapshot checkpointData) {
+	for _, hold := range snapshot.Holds {
+		db.holds[hold.ID] = hold
+	}
 	for _, account := range snapshot.Accounts {
 		db.accounts[shardIndex(account.ID)].items[account.ID] = account
 	}

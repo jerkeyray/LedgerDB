@@ -3,8 +3,10 @@
 ## Commit ordering
 
 LedgerDB reserves the idempotency key, locks affected accounts, validates the
-request, assigns an LSN, appends one record, and calls `File.Sync`. Only after a
-successful sync does it update in-memory balances and publish the response.
+queued operations against staged state, assigns each accepted operation its own
+LSN, appends independently checksummed records, and calls `File.Sync` once per
+touched segment. Only after every required sync succeeds does it publish account
+and hold state and responses. The default batch size is one.
 
 `File.Sync` is Go's portable full-sync operation. A successful return means the
 operating system reported that the WAL file was synchronized. Segment creation,
@@ -15,8 +17,10 @@ the relevant directories.
 
 `Open` acquires the exclusive directory lock before reading or repairing files.
 It installs the manifest checkpoint, then replays WAL records newer than the
-checkpoint base in strict LSN order. Per-entry LSNs prevent double application
-when a fuzzy checkpoint already includes a newer mutation.
+checkpoint base in strict LSN order. Per-account, per-hold, and per-key LSNs prevent double application
+when a fuzzy checkpoint already includes a newer mutation. After replay,
+recovery verifies that active hold totals match reserved balances and terminal
+hold states/results agree. The new reader accepts v1 and v2; new writes are v2.
 
 A physically incomplete final header or payload is an uncommitted torn tail and
 is truncated and synchronized. A complete record with an invalid header, CRC,
@@ -34,8 +38,10 @@ starts only after the new manifest is durable.
 
 Any WAL write or sync failure makes the durable outcome uncertain. LedgerDB
 marks the handle poisoned and never retries sync in-process. Restart recovery
-determines whether the record exists; retrying the original key then returns the
-stored result or performs the operation once.
+determines which complete records exist. A group can recover as a prefix; it is
+not an atomic multi-operation transaction. Retry each original key to resolve
+its outcome. Terminal hold state additionally prevents a repeated settlement or
+cancellation even after the request key expires.
 
 ## Threat model
 

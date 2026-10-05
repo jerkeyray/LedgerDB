@@ -15,11 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
 	Magic                      = "LDBW"
-	Version             uint16 = 1
+	Version             uint16 = 2
 	headerSize                 = 16
 	MaxRecordBytes      int64  = 1 << 20
 	DefaultSegmentBytes int64  = 64 << 20
@@ -52,6 +53,7 @@ type Record struct {
 	Fingerprint [32]byte        `json:"fingerprint"`
 	Request     json.RawMessage `json:"request"`
 	Result      json.RawMessage `json:"result"`
+	State       json.RawMessage `json:"state,omitempty"`
 }
 
 func Encode(record Record) ([]byte, error) {
@@ -74,7 +76,7 @@ func Encode(record Record) ([]byte, error) {
 
 func Decode(data []byte) (Record, error) {
 	var record Record
-	if len(data) < headerSize || string(data[:4]) != Magic || binary.LittleEndian.Uint16(data[4:6]) != Version || binary.LittleEndian.Uint16(data[6:8]) != 0 {
+	if len(data) < headerSize || string(data[:4]) != Magic || !supportedVersion(binary.LittleEndian.Uint16(data[4:6])) || binary.LittleEndian.Uint16(data[6:8]) != 0 {
 		return record, ErrCorrupt
 	}
 	n := int(binary.LittleEndian.Uint32(data[8:12]))
@@ -94,6 +96,8 @@ func Decode(data []byte) (Record, error) {
 	return record, nil
 }
 
+func supportedVersion(v uint16) bool { return v == 1 || v == Version }
+
 type Writer struct {
 	mu           sync.Mutex
 	fs           FS
@@ -102,6 +106,8 @@ type Writer struct {
 	file         File
 	segment      uint64
 	size         int64
+	syncCount    uint64
+	syncDuration time.Duration
 }
 
 func Open(filesystem FS, dir string, segmentBytes int64) (*Writer, error) {
@@ -133,32 +139,65 @@ func Open(filesystem FS, dir string, segmentBytes int64) (*Writer, error) {
 	return &Writer{fs: filesystem, dir: dir, segmentBytes: segmentBytes, file: f, segment: segment, size: info.Size()}, nil
 }
 
-func (w *Writer) Append(record Record) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	encoded, err := Encode(record)
-	if err != nil {
-		return err
-	}
-	if w.size > 0 && w.size+int64(len(encoded)) > w.segmentBytes {
-		if err := w.rotate(); err != nil {
+func (w *Writer) Append(record Record) error { return w.AppendBatch([]Record{record}) }
+
+// AppendBatch encodes before writing, retaining independent record boundaries.
+// Every touched segment is synchronized before success; a crash may retain a prefix.
+func (w *Writer) AppendBatch(records []Record) error {
+	encoded := make([][]byte, len(records))
+	for i, record := range records {
+		var err error
+		encoded[i], err = Encode(record)
+		if err != nil {
 			return err
 		}
 	}
-	for len(encoded) > 0 {
-		n, writeErr := w.file.Write(encoded)
-		if n > 0 {
-			w.size += int64(n)
-			encoded = encoded[n:]
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	dirty := false
+	for _, data := range encoded {
+		if w.size > 0 && w.size+int64(len(data)) > w.segmentBytes {
+			if dirty {
+				if err := w.sync(); err != nil {
+					return err
+				}
+				dirty = false
+			}
+			if err := w.rotate(); err != nil {
+				return err
+			}
 		}
-		if writeErr != nil {
-			return writeErr
+		for len(data) > 0 {
+			n, err := w.file.Write(data)
+			if n > 0 {
+				w.size += int64(n)
+				data = data[n:]
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
 		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
+		dirty = true
 	}
-	return w.file.Sync()
+	if dirty {
+		return w.sync()
+	}
+	return nil
+}
+func (w *Writer) sync() error {
+	start := time.Now()
+	err := w.file.Sync()
+	w.syncCount++
+	w.syncDuration += time.Since(start)
+	return err
+}
+func (w *Writer) SyncStats() (uint64, time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.syncCount, w.syncDuration
 }
 
 func (w *Writer) rotate() error {
@@ -284,7 +323,7 @@ func scanSegment(filesystem FS, path string, apply func(Record) error, repairTai
 		if _, err := f.ReadAt(header, offset); err != nil {
 			return 0, err
 		}
-		if string(header[:4]) != Magic || binary.LittleEndian.Uint16(header[4:6]) != Version || binary.LittleEndian.Uint16(header[6:8]) != 0 {
+		if string(header[:4]) != Magic || !supportedVersion(binary.LittleEndian.Uint16(header[4:6])) || binary.LittleEndian.Uint16(header[6:8]) != 0 {
 			return 0, fmt.Errorf("%w: invalid header at %s offset %d", ErrCorrupt, path, offset)
 		}
 		bodyLen := int64(binary.LittleEndian.Uint32(header[8:12]))

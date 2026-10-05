@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/fs"
-	"math"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -24,6 +23,7 @@ type accountState struct {
 	ID       string `json:"id"`
 	Currency string `json:"currency"`
 	Balance  int64  `json:"balance"`
+	Reserved int64  `json:"reserved,omitempty"`
 	LSN      uint64 `json:"lsn"`
 }
 
@@ -63,14 +63,27 @@ type DB struct {
 	accounts [shardCount]accountShard
 	idem     [shardCount]idempotencyShard
 
-	commitMu      sync.Mutex
-	checkpointMu  sync.Mutex
-	writer        *wal.Writer
-	directoryLock Lock
-	nextLSN       uint64
-	closed        atomic.Bool
-	poisoned      atomic.Bool
-	pruneCursor   atomic.Uint32
+	commitMu       sync.Mutex
+	checkpointMu   sync.Mutex
+	writer         *wal.Writer
+	directoryLock  Lock
+	nextLSN        uint64
+	closed         atomic.Bool
+	poisoned       atomic.Bool
+	pruneCursor    atomic.Uint32
+	holdsMu        sync.RWMutex
+	holds          map[string]Hold
+	queue          chan *mutation
+	admissionMu    sync.RWMutex
+	closing        bool
+	stop           chan struct{}
+	workerDone     chan struct{}
+	checkpointDone chan struct{}
+	checkpointWake chan struct{}
+	closeOnce      sync.Once
+	closeErr       error
+	options        Options
+	metrics        dbMetrics
 }
 
 // Open creates or recovers a database and exclusively locks its directory.
@@ -111,7 +124,19 @@ func Open(path string, options Options) (*DB, error) {
 		return failOpen(err)
 	}
 
-	db := &DB{dir: path, fs: filesystem, clock: clock, retention: retention, directoryLock: directoryLock}
+	if options.GroupCommitMaxBatch < 0 || options.GroupCommitDelay < 0 || options.CheckpointInterval < 0 {
+		return failOpen(fmt.Errorf("ledgerdb: negative scheduling option"))
+	}
+	if options.GroupCommitMaxBatch == 0 {
+		options.GroupCommitMaxBatch = 1
+	}
+	if options.GroupCommitMaxBatch > 1024 {
+		return failOpen(fmt.Errorf("ledgerdb: batch size exceeds queue capacity"))
+	}
+	recoveryStart := time.Now()
+	db := &DB{dir: path, fs: filesystem, clock: clock, retention: retention, directoryLock: directoryLock,
+		holds: make(map[string]Hold), queue: make(chan *mutation, 1024), stop: make(chan struct{}),
+		workerDone: make(chan struct{}), checkpointDone: make(chan struct{}), checkpointWake: make(chan struct{}, 1), options: options}
 	for i := range db.accounts {
 		db.accounts[i].items = make(map[string]accountState)
 	}
@@ -132,11 +157,19 @@ func Open(path string, options Options) (*DB, error) {
 		return failOpen(err)
 	}
 	db.nextLSN = maxLSN
+	if err := db.validateRecoveredState(); err != nil {
+		return failOpen(err)
+	}
+	db.metrics.lsn.Store(maxLSN)
+	db.metrics.checkpointLSN = replayFrom
+	db.metrics.recoveryNanos.Store(int64(time.Since(recoveryStart)))
 	writer, err := wal.Open(walFS, path, options.WALSegmentBytes)
 	if err != nil {
 		return failOpen(err)
 	}
 	db.writer = writer
+	go db.commitLoop()
+	go db.checkpointLoop()
 	return db, nil
 }
 
@@ -146,189 +179,18 @@ func (adapter walFSAdapter) OpenFile(path string, flag int, mode fs.FileMode) (w
 	return adapter.FileSystem.OpenFile(path, flag, mode)
 }
 
-// CreateAccount durably creates an account. Matching retries within the
-// retention lease return the original result.
+// CreateAccount durably creates an account with safe retries.
 func (db *DB) CreateAccount(ctx context.Context, key string, request CreateAccountRequest) (CreateAccountResult, error) {
-	var zero CreateAccountResult
-	if err := checkContext(ctx); err != nil {
-		return zero, err
-	}
-	if err := db.usable(); err != nil {
-		return zero, err
-	}
-	if err := validateKey(key); err != nil {
-		return zero, err
-	}
-	if err := validateAccountID(request.ID); err != nil {
-		return zero, err
-	}
-	if err := validateCurrency(request.Currency); err != nil {
-		return zero, err
-	}
-	if request.OpeningBalance < 0 {
-		return zero, ErrInvalidOpeningBalance
-	}
-
-	fingerprint, requestBytes, err := fingerprint("create_account", request)
-	if err != nil {
-		return zero, err
-	}
-	existing, owner, err := db.reserve(ctx, key, fingerprint)
-	if err != nil {
-		return zero, err
-	}
-	if !owner {
-		return decodeCreateResult(existing)
-	}
-
-	shard := &db.accounts[shardIndex(request.ID)]
-	shard.Lock()
-	defer shard.Unlock()
-	if _, ok := shard.items[request.ID]; ok {
-		db.abortReservation(key)
-		return zero, ErrAccountExists
-	}
-
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-	if err := db.usable(); err != nil {
-		db.abortReservation(key)
-		return zero, err
-	}
-	if db.nextLSN == math.MaxUint64 {
-		db.abortReservation(key)
-		return zero, ErrLSNExhausted
-	}
-	lsn := db.nextLSN + 1
-	result := CreateAccountResult{
-		Account:   Account{ID: request.ID, Currency: request.Currency, Balance: request.OpeningBalance, LSN: lsn},
-		CommitLSN: lsn,
-	}
-	resultBytes, err := json.Marshal(result)
-	if err != nil {
-		db.abortReservation(key)
-		return zero, err
-	}
-	record := wal.Record{Type: "create_account", LSN: lsn, CommittedAt: db.clock().UnixNano(), Key: key, Fingerprint: fingerprint, Request: requestBytes, Result: resultBytes}
-	if err := db.writer.Append(record); err != nil {
-		db.poisoned.Store(true)
-		db.abortReservation(key)
-		return zero, fmt.Errorf("%w: WAL append: %w", ErrPoisoned, err)
-	}
-	db.nextLSN = lsn
-	shard.items[request.ID] = accountState{ID: request.ID, Currency: request.Currency, Balance: request.OpeningBalance, LSN: lsn}
-	db.commitReservation(key, record)
-	db.pruneOneIdempotencyShard()
-	return result, nil
+	var result CreateAccountResult
+	err := db.submit(ctx, key, "create_account", request, &result)
+	return result, err
 }
 
-// Transfer durably and atomically moves funds between two accounts.
+// Transfer atomically moves available funds between two accounts.
 func (db *DB) Transfer(ctx context.Context, key string, request TransferRequest) (TransferResult, error) {
-	var zero TransferResult
-	if err := checkContext(ctx); err != nil {
-		return zero, err
-	}
-	if err := db.usable(); err != nil {
-		return zero, err
-	}
-	if err := validateKey(key); err != nil {
-		return zero, err
-	}
-	if err := validateAccountID(request.FromAccount); err != nil {
-		return zero, err
-	}
-	if err := validateAccountID(request.ToAccount); err != nil {
-		return zero, err
-	}
-	if request.FromAccount == request.ToAccount {
-		return zero, ErrSameAccount
-	}
-	if request.Amount <= 0 {
-		return zero, ErrInvalidAmount
-	}
-
-	fingerprint, requestBytes, err := fingerprint("transfer", request)
-	if err != nil {
-		return zero, err
-	}
-	existing, owner, err := db.reserve(ctx, key, fingerprint)
-	if err != nil {
-		return zero, err
-	}
-	if !owner {
-		return decodeTransferResult(existing)
-	}
-
-	fromIndex, toIndex := shardIndex(request.FromAccount), shardIndex(request.ToAccount)
-	first, second := fromIndex, toIndex
-	if second < first {
-		first, second = second, first
-	}
-	db.accounts[first].Lock()
-	if second != first {
-		db.accounts[second].Lock()
-	}
-	defer func() {
-		if second != first {
-			db.accounts[second].Unlock()
-		}
-		db.accounts[first].Unlock()
-	}()
-
-	from, ok := db.accounts[fromIndex].items[request.FromAccount]
-	if !ok {
-		db.abortReservation(key)
-		return zero, ErrAccountNotFound
-	}
-	to, ok := db.accounts[toIndex].items[request.ToAccount]
-	if !ok {
-		db.abortReservation(key)
-		return zero, ErrAccountNotFound
-	}
-	if from.Currency != to.Currency {
-		db.abortReservation(key)
-		return zero, ErrCurrencyMismatch
-	}
-	if from.Balance < request.Amount {
-		db.abortReservation(key)
-		return zero, ErrInsufficientFunds
-	}
-	if to.Balance > math.MaxInt64-request.Amount {
-		db.abortReservation(key)
-		return zero, ErrBalanceOverflow
-	}
-
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-	if err := db.usable(); err != nil {
-		db.abortReservation(key)
-		return zero, err
-	}
-	if db.nextLSN == math.MaxUint64 {
-		db.abortReservation(key)
-		return zero, ErrLSNExhausted
-	}
-	lsn := db.nextLSN + 1
-	result := TransferResult{FromBalance: from.Balance - request.Amount, ToBalance: to.Balance + request.Amount, CommitLSN: lsn}
-	resultBytes, err := json.Marshal(result)
-	if err != nil {
-		db.abortReservation(key)
-		return zero, err
-	}
-	record := wal.Record{Type: "transfer", LSN: lsn, CommittedAt: db.clock().UnixNano(), Key: key, Fingerprint: fingerprint, Request: requestBytes, Result: resultBytes}
-	if err := db.writer.Append(record); err != nil {
-		db.poisoned.Store(true)
-		db.abortReservation(key)
-		return zero, fmt.Errorf("%w: WAL append: %w", ErrPoisoned, err)
-	}
-	db.nextLSN = lsn
-	from.Balance, from.LSN = result.FromBalance, lsn
-	to.Balance, to.LSN = result.ToBalance, lsn
-	db.accounts[fromIndex].items[from.ID] = from
-	db.accounts[toIndex].items[to.ID] = to
-	db.commitReservation(key, record)
-	db.pruneOneIdempotencyShard()
-	return result, nil
+	var result TransferResult
+	err := db.submit(ctx, key, "transfer", request, &result)
+	return result, err
 }
 
 // GetAccount returns the latest in-memory snapshot of an account.
@@ -354,23 +216,21 @@ func (db *DB) GetAccount(ctx context.Context, id string) (Account, error) {
 
 // Close closes the WAL and releases the exclusive directory lock.
 func (db *DB) Close() error {
-	db.checkpointMu.Lock()
-	defer db.checkpointMu.Unlock()
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-	if db.closed.Swap(true) {
-		return nil
-	}
-	var writerErr error
-	if db.writer != nil {
-		writerErr = db.writer.Close()
-	}
-	var lockErr error
-	if db.directoryLock != nil {
-		lockErr = db.directoryLock.Close()
-		db.directoryLock = nil
-	}
-	return errors.Join(writerErr, lockErr)
+	db.closeOnce.Do(func() {
+		db.admissionMu.Lock()
+		db.closing = true
+		close(db.stop)
+		db.admissionMu.Unlock()
+		<-db.checkpointDone
+		<-db.workerDone
+		db.checkpointMu.Lock()
+		defer db.checkpointMu.Unlock()
+		db.commitMu.Lock()
+		defer db.commitMu.Unlock()
+		db.closed.Store(true)
+		db.closeErr = errors.Join(db.writer.Close(), db.directoryLock.Close())
+	})
+	return db.closeErr
 }
 
 func (db *DB) usable() error {
@@ -402,6 +262,7 @@ func (db *DB) reserve(ctx context.Context, key string, fingerprint [32]byte) (*i
 			return nil, false, ErrIdempotencyConflict
 		}
 		if entry.State == idemCommitted {
+			db.metrics.duplicates.Add(1)
 			copyOf := *entry
 			copyOf.Result = append(json.RawMessage(nil), entry.Result...)
 			shard.Unlock()
@@ -446,9 +307,6 @@ func (db *DB) abortReservation(key string) {
 }
 
 func (db *DB) expired(committedAt int64) bool {
-	if db.retention == 0 {
-		return false
-	}
 	return db.clock().Sub(time.Unix(0, committedAt)) >= db.retention
 }
 
@@ -465,39 +323,70 @@ func (db *DB) pruneOneIdempotencyShard() {
 }
 
 func (db *DB) applyRecoveryRecord(record wal.Record) error {
-	switch record.Type {
-	case "create_account":
-		var result CreateAccountResult
-		if err := json.Unmarshal(record.Result, &result); err != nil {
-			return fmt.Errorf("%w: create result", wal.ErrCorrupt)
+	if len(record.State) != 0 {
+		switch record.Type {
+		case "create_account", "transfer", "reserve", "settle", "cancel":
+		default:
+			return fmt.Errorf("%w: unknown record type", wal.ErrCorrupt)
 		}
-		index := shardIndex(result.Account.ID)
-		current, exists := db.accounts[index].items[result.Account.ID]
-		if !exists || current.LSN < record.LSN {
-			db.accounts[index].items[result.Account.ID] = accountState{ID: result.Account.ID, Currency: result.Account.Currency, Balance: result.Account.Balance, LSN: record.LSN}
+		var state stateUpdates
+		if json.Unmarshal(record.State, &state) != nil {
+			return fmt.Errorf("%w: state payload", wal.ErrCorrupt)
 		}
-	case "transfer":
-		var request TransferRequest
-		var result TransferResult
-		if json.Unmarshal(record.Request, &request) != nil || json.Unmarshal(record.Result, &result) != nil {
-			return fmt.Errorf("%w: transfer payload", wal.ErrCorrupt)
+		for _, account := range state.Accounts {
+			if account.LSN != record.LSN {
+				return fmt.Errorf("%w: account LSN", wal.ErrCorrupt)
+			}
+			index := shardIndex(account.ID)
+			current, exists := db.accounts[index].items[account.ID]
+			if !exists || current.LSN < record.LSN {
+				db.accounts[index].items[account.ID] = account
+			}
 		}
-		fromIndex, toIndex := shardIndex(request.FromAccount), shardIndex(request.ToAccount)
-		from, fromOK := db.accounts[fromIndex].items[request.FromAccount]
-		to, toOK := db.accounts[toIndex].items[request.ToAccount]
-		if !fromOK || !toOK {
-			return fmt.Errorf("%w: transfer references missing account", wal.ErrCorrupt)
+		for _, hold := range state.Holds {
+			if hold.LSN != record.LSN {
+				return fmt.Errorf("%w: hold LSN", wal.ErrCorrupt)
+			}
+			current, exists := db.holds[hold.ID]
+			if !exists || current.LSN < record.LSN {
+				db.holds[hold.ID] = hold
+			}
 		}
-		if from.LSN < record.LSN {
-			from.Balance, from.LSN = result.FromBalance, record.LSN
-			db.accounts[fromIndex].items[from.ID] = from
+	} else {
+		switch record.Type {
+		case "create_account":
+			var result CreateAccountResult
+			if err := json.Unmarshal(record.Result, &result); err != nil {
+				return fmt.Errorf("%w: create result", wal.ErrCorrupt)
+			}
+			index := shardIndex(result.Account.ID)
+			current, exists := db.accounts[index].items[result.Account.ID]
+			if !exists || current.LSN < record.LSN {
+				db.accounts[index].items[result.Account.ID] = accountState{ID: result.Account.ID, Currency: result.Account.Currency, Balance: result.Account.Balance, LSN: record.LSN}
+			}
+		case "transfer":
+			var request TransferRequest
+			var result TransferResult
+			if json.Unmarshal(record.Request, &request) != nil || json.Unmarshal(record.Result, &result) != nil {
+				return fmt.Errorf("%w: transfer payload", wal.ErrCorrupt)
+			}
+			fromIndex, toIndex := shardIndex(request.FromAccount), shardIndex(request.ToAccount)
+			from, fromOK := db.accounts[fromIndex].items[request.FromAccount]
+			to, toOK := db.accounts[toIndex].items[request.ToAccount]
+			if !fromOK || !toOK {
+				return fmt.Errorf("%w: transfer references missing account", wal.ErrCorrupt)
+			}
+			if from.LSN < record.LSN {
+				from.Balance, from.LSN = result.FromBalance, record.LSN
+				db.accounts[fromIndex].items[from.ID] = from
+			}
+			if to.LSN < record.LSN {
+				to.Balance, to.LSN = result.ToBalance, record.LSN
+				db.accounts[toIndex].items[to.ID] = to
+			}
+		default:
+			return fmt.Errorf("%w: unknown record type %q", wal.ErrCorrupt, record.Type)
 		}
-		if to.LSN < record.LSN {
-			to.Balance, to.LSN = result.ToBalance, record.LSN
-			db.accounts[toIndex].items[to.ID] = to
-		}
-	default:
-		return fmt.Errorf("%w: unknown record type %q", wal.ErrCorrupt, record.Type)
 	}
 	if !db.expired(record.CommittedAt) {
 		index := shardIndex(record.Key)
@@ -507,28 +396,6 @@ func (db *DB) applyRecoveryRecord(record wal.Record) error {
 		}
 	}
 	return nil
-}
-
-func decodeCreateResult(entry *idempotencyEntry) (CreateAccountResult, error) {
-	if entry.Type != "create_account" {
-		return CreateAccountResult{}, ErrIdempotencyConflict
-	}
-	var result CreateAccountResult
-	if err := json.Unmarshal(entry.Result, &result); err != nil {
-		return result, fmt.Errorf("%w: stored create result", ErrCorrupt)
-	}
-	return result, nil
-}
-
-func decodeTransferResult(entry *idempotencyEntry) (TransferResult, error) {
-	if entry.Type != "transfer" {
-		return TransferResult{}, ErrIdempotencyConflict
-	}
-	var result TransferResult
-	if err := json.Unmarshal(entry.Result, &result); err != nil {
-		return result, fmt.Errorf("%w: stored transfer result", ErrCorrupt)
-	}
-	return result, nil
 }
 
 func fingerprint(operation string, request any) ([32]byte, []byte, error) {
@@ -590,7 +457,7 @@ func checkContext(ctx context.Context) error {
 }
 
 func (state accountState) public() Account {
-	return Account{ID: state.ID, Currency: state.Currency, Balance: state.Balance, LSN: state.LSN}
+	return Account{ID: state.ID, Currency: state.Currency, Balance: state.Balance, Reserved: state.Reserved, Available: state.Balance - state.Reserved, LSN: state.LSN}
 }
 
 func checkpointPath(dir string, baseLSN uint64) string {

@@ -37,7 +37,7 @@ both allocation rate and retained heap bytes per key.
 Collect latency percentiles as JSON with the standalone runner:
 
 ```bash
-go run ./cmd/ledgerdb-bench -operations 100000 -workers 8 | tee latency.jsonl
+go run ./cmd/ledgerdb-bench -mode compare -trials 3 -operations 1000 -workers 16 | tee latency.jsonl
 ```
 
 Report operations/second and p50/p95/p99 latency for disjoint, uniform, and
@@ -56,3 +56,19 @@ Subprocess termination validates process-crash behavior, not removal of power
 from the storage device. Power-loss claims require an environment such as a VM,
 device-mapper fault target, or dedicated test machine that can discard volatile
 device caches at controlled persistence points.
+
+## Payment lifecycle and group commit
+
+`go run ./cmd/ledgerdb-demo` runs an asserted real-subprocess crash walkthrough;
+[review-demo.md](review-demo.md) includes the review script and local measurements.
+The runner creates fresh datasets per mode and trial; setup is excluded. Report
+WAL sync counts, average batch size, configured collection delay, and percentiles
+alongside throughput. Default group settings are a 64-operation limit and 1 ms
+window. Include workers=1 measurements when evaluating isolated-request latency.
+
+The expanded suite exercises competing reservations, terminal retries after key
+expiry, settle/cancel races, queued cancellation/backpressure, shutdown,
+checkpoints under lifecycle load, v1 storage reads, v2 format rejection, batch
+encoding before writes, shared syncs, rotation, torn prefixes, and uncertain
+write/sync outcomes. Acknowledged operations must survive; unacknowledged batch
+members may survive as a prefix and are resolved individually by retry.

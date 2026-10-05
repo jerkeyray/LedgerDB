@@ -7,11 +7,11 @@
 </p>
 
 <p align="center">
-  <strong>Exactly-once money movement, embedded in Go.</strong>
+  <strong>Crash-safe payment lifecycles, embedded in Go.</strong>
 </p>
 
 <p align="center">
-  Atomic transfers · Durable idempotency · Redo-only recovery · Zero external services
+  Reserve · Settle · Cancel · Durable retries · Optional group commit
 </p>
 
 <p align="center">
@@ -29,9 +29,25 @@
 
 ---
 
-## One durable record. One committed transfer.
+## Show the failure, then show the guarantee
 
-That is the core idea. LedgerDB stores the balance mutation and its idempotency
+```bash
+go run ./cmd/ledgerdb-demo
+```
+
+The terminal demo reserves ₹500 for campus EV charging, bills ₹180, and kills a
+real child process immediately after settlement's WAL sync. Recovery restores
+₹820 available and ₹180 paid. Same-key and different-key retries return the
+original settlement result. A second session races settlement against
+cancellation; exactly one outcome wins. Every scene checks balances and funds
+conservation. Evidence files remain in a fresh temporary directory.
+
+See [the review walkthrough](docs/review-demo.md) for commands, talking points,
+and the [payment lifecycle guide](docs/payments.md) for the API.
+
+## One durable record. One committed operation.
+
+That is the core idea. LedgerDB stores the balance/hold mutation and its idempotency
 completion result in the **same checksummed WAL record**. Once that record is
 synchronized, the transfer exists; before it is synchronized, account state is
 untouched.
@@ -49,6 +65,10 @@ This one-record boundary gives LedgerDB its useful properties:
 ## What is included
 
 - Thread-safe account creation, balance reads, and two-account transfers.
+- Durable payment holds, partial/zero settlement, cancellation, and hold reads.
+- Total, reserved, and available balances; transfers cannot spend reserved funds.
+- Opt-in group commit with ordered validation and shared WAL synchronization.
+- Optional automatic checkpoints and exported operational statistics.
 - Signed 64-bit minor units and three-letter currency identifiers.
 - Caller-supplied idempotency keys with concurrent retry rendezvous.
 - Configurable key leases with automatic in-memory reclamation.
@@ -123,20 +143,20 @@ transfer again. Reusing it for a different request returns
 ## Commit model
 
 ```text
-reserve key → lock accounts → validate → append WAL → sync
+reserve key → queue → stage/validate batch → append WAL → sync
                                                     │
                                                     ▼
-                                  apply balances → publish result
+                                  apply balances/holds → publish results
 ```
 
-The WAL sequencer assigns a monotonic LSN and is held until both account state
+The commit coordinator assigns a monotonic LSN per operation and holds the commit barrier until account/hold state
 and the idempotency result are visible. If WAL write or sync returns an error,
 the database rejects further mutations with `ErrPoisoned`. Close it, reopen it,
 and retry the same key to discover the durable outcome safely.
 
 ## Guarantees at a glance
 
-| Property | LedgerDB v1 behavior |
+| Property | Current behavior |
 | --- | --- |
 | Transfer atomicity | Both balances change, or neither changes |
 | Retry behavior | Exactly once within the configured key lease |
@@ -146,7 +166,10 @@ and retry the same key to discover the durable outcome safely.
 | Complete corruption | Open fails with `ErrCorrupt` |
 | Writer ownership | One process; enforced with an exclusive directory lock |
 | Cross-currency transfer | Rejected |
-| Overdraft | Rejected |
+| Overdraft | Rejected, including spending reserved funds |
+| Payment lifecycle | A hold settles or cancels once; matching terminal retries return the original result |
+| Group commit | Opt-in; acknowledgements wait for all touched WAL segments to sync |
+| Automatic checkpoints | Opt-in interval and/or committed-operation threshold |
 
 ## Documentation
 
@@ -176,7 +199,7 @@ go vet ./...
 Run transfer latency workloads and emit JSON percentiles:
 
 ```bash
-go run ./cmd/ledgerdb-bench -operations 10000 -workers 8
+go run ./cmd/ledgerdb-bench -mode compare -trials 3 -operations 1000 -workers 16
 ```
 
 Run Go benchmarks for throughput, recovery scaling, checkpoint impact, and
@@ -188,9 +211,13 @@ go test -run '^$' -bench . -benchmem ./...
 
 ## Scope and status
 
-LedgerDB v1 is a single-node, embedded ledger—not a replicated bank database.
-Transactions are limited to account creation or one transfer between two
-accounts. Opening balances introduce funds from outside the ledger; use an
+LedgerDB is a single-node, embedded ledger. Each operation is one durable
+account creation, transfer, reservation, settlement, or cancellation record.
+Grouped operations can recover as a prefix; a batch is not one atomic transaction.
+Terminal holds are retained indefinitely to prevent repeated financial effects,
+so their memory and checkpoint footprint grows with payment history.
+New writes use storage format v2; the reader accepts v1 and v2. Downgrading to
+an older binary after v2 writes is unsupported. Opening balances introduce funds from outside the ledger; use an
 explicit source account when strict double-entry conservation is required.
 
 Durability ultimately depends on the kernel, filesystem, mount options, device

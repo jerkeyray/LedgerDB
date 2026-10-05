@@ -3,6 +3,10 @@ package ledgerdb
 import "errors"
 
 var (
+	ErrInvalidHoldID         = errors.New("ledgerdb: hold ID must be valid UTF-8 and 1 to 128 bytes")
+	ErrHoldExists            = errors.New("ledgerdb: hold already exists")
+	ErrHoldNotFound          = errors.New("ledgerdb: hold not found")
+	ErrHoldConflict          = errors.New("ledgerdb: conflicting hold transition")
 	ErrClosed                = errors.New("ledgerdb: database is closed")
 	ErrAlreadyOpen           = errors.New("ledgerdb: database is already open by another process")
 	ErrLockUnsupported       = errors.New("ledgerdb: filesystem does not support exclusive locking")

@@ -20,62 +20,97 @@ import (
 )
 
 type result struct {
-	Workload        string  `json:"workload"`
-	Operations      int     `json:"operations"`
-	Workers         int     `json:"workers"`
-	Accounts        int     `json:"accounts"`
-	ElapsedSeconds  float64 `json:"elapsed_seconds"`
-	OperationsSec   float64 `json:"operations_per_second"`
-	P50Microseconds float64 `json:"p50_microseconds"`
-	P95Microseconds float64 `json:"p95_microseconds"`
-	P99Microseconds float64 `json:"p99_microseconds"`
+	Trial                  int     `json:"trial"`
+	Mode                   string  `json:"mode"`
+	WALSyncs               uint64  `json:"wal_syncs"`
+	WALSyncMicroseconds    float64 `json:"wal_sync_microseconds"`
+	AverageBatchSize       float64 `json:"average_batch_size"`
+	GoVersion              string  `json:"go_version"`
+	Platform               string  `json:"platform"`
+	BatchLimit             int     `json:"batch_limit"`
+	CollectionMicroseconds float64 `json:"collection_microseconds"`
+	Workload               string  `json:"workload"`
+	Operations             int     `json:"operations"`
+	Workers                int     `json:"workers"`
+	Accounts               int     `json:"accounts"`
+	ElapsedSeconds         float64 `json:"elapsed_seconds"`
+	OperationsSec          float64 `json:"operations_per_second"`
+	P50Microseconds        float64 `json:"p50_microseconds"`
+	P95Microseconds        float64 `json:"p95_microseconds"`
+	P99Microseconds        float64 `json:"p99_microseconds"`
 }
 
 func main() {
+	trials := flag.Int("trials", 1, "repeated trials on fresh databases")
+	mode := flag.String("mode", "compare", "individual, group, or compare")
+	batchSize := flag.Int("batch-size", 64, "group commit batch limit")
+	batchDelay := flag.Duration("batch-delay", time.Millisecond, "group commit collection window")
 	operations := flag.Int("operations", 10_000, "number of transfers per workload")
 	workers := flag.Int("workers", runtime.GOMAXPROCS(0), "concurrent workers")
 	accounts := flag.Int("accounts", 64, "accounts for uniform and hot workloads")
 	workload := flag.String("workload", "all", "disjoint, uniform, hot-account, or all")
 	dir := flag.String("dir", "", "parent directory for benchmark databases; defaults to a temporary directory")
 	flag.Parse()
-	if *operations <= 0 || *workers <= 0 || *accounts < 2 {
+	if *trials < 1 || *operations <= 0 || *workers <= 0 || *accounts < 2 {
 		fatalf("operations and workers must be positive; accounts must be at least two")
 	}
-	root := *dir
-	cleanup := func() {}
-	if root == "" {
-		var err error
-		root, err = os.MkdirTemp("", "ledgerdb-bench-")
-		if err != nil {
-			fatalf("create temp directory: %v", err)
-		}
-		cleanup = func() { _ = os.RemoveAll(root) }
+	if *mode != "individual" && *mode != "group" && *mode != "compare" {
+		fatalf("unknown mode %q", *mode)
 	}
-	defer cleanup()
+	if *batchSize < 1 || *batchSize > 1024 || *batchDelay < 0 {
+		fatalf("invalid group commit settings")
+	}
+	root, err := os.MkdirTemp(*dir, "ledgerdb-bench-")
+	if err != nil {
+		fatalf("create fresh benchmark directory: %v", err)
+	}
+	if *dir == "" {
+		defer os.RemoveAll(root)
+	}
+	modes := []string{*mode}
+	if *mode == "compare" {
+		modes = []string{"individual", "group"}
+	}
 	workloads := []string{*workload}
 	if *workload == "all" {
 		workloads = []string{"disjoint", "uniform", "hot-account"}
 	}
 	encoder := json.NewEncoder(os.Stdout)
-	for _, name := range workloads {
-		if name != "disjoint" && name != "uniform" && name != "hot-account" {
-			fatalf("unknown workload %q", name)
-		}
-		measurement, err := run(context.Background(), filepath.Join(root, name), name, *operations, *workers, *accounts)
-		if err != nil {
-			fatalf("%s: %v", name, err)
-		}
-		if err := encoder.Encode(measurement); err != nil {
-			fatalf("encode result: %v", err)
+	for trial := 1; trial <= *trials; trial++ {
+		for _, modeName := range modes {
+			for _, name := range workloads {
+				if name != "disjoint" && name != "uniform" && name != "hot-account" {
+					fatalf("unknown workload %q", name)
+				}
+				opts := ledgerdb.Options{}
+				if modeName == "group" {
+					opts.GroupCommitMaxBatch = *batchSize
+					opts.GroupCommitDelay = *batchDelay
+				}
+				measurement, err := run(context.Background(), filepath.Join(root, fmt.Sprint(trial), modeName, name), name, *operations, *workers, *accounts, opts)
+				measurement.Mode = modeName
+				measurement.Trial = trial
+				measurement.BatchLimit = 1
+				if modeName == "group" {
+					measurement.BatchLimit = *batchSize
+					measurement.CollectionMicroseconds = float64(*batchDelay) / float64(time.Microsecond)
+				}
+				if err != nil {
+					fatalf("%s: %v", name, err)
+				}
+				if err := encoder.Encode(measurement); err != nil {
+					fatalf("encode result: %v", err)
+				}
+			}
 		}
 	}
 }
 
-func run(ctx context.Context, dir, workload string, operations, workers, accounts int) (result, error) {
+func run(ctx context.Context, dir, workload string, operations, workers, accounts int, opts ledgerdb.Options) (result, error) {
 	if workload == "disjoint" && accounts < workers*2 {
 		accounts = workers * 2
 	}
-	db, err := ledgerdb.Open(dir, ledgerdb.Options{})
+	db, err := ledgerdb.Open(dir, opts)
 	if err != nil {
 		return result{}, err
 	}
@@ -86,6 +121,7 @@ func run(ctx context.Context, dir, workload string, operations, workers, account
 			return result{}, err
 		}
 	}
+	before := db.Stats()
 	durations := make([]time.Duration, operations)
 	var next atomic.Uint64
 	errorsCh := make(chan error, workers)
@@ -121,7 +157,11 @@ func run(ctx context.Context, dir, workload string, operations, workers, account
 		}
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	after := db.Stats()
+	average := float64(after.Mutations-before.Mutations) / float64(after.Batches-before.Batches)
 	return result{
+		WALSyncs: after.WALSyncs - before.WALSyncs, WALSyncMicroseconds: float64(after.WALSyncDuration-before.WALSyncDuration) / float64(time.Microsecond), AverageBatchSize: average,
+		GoVersion: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH,
 		Workload: workload, Operations: operations, Workers: workers, Accounts: accounts,
 		ElapsedSeconds: elapsed.Seconds(), OperationsSec: float64(operations) / elapsed.Seconds(),
 		P50Microseconds: percentile(durations, 0.50), P95Microseconds: percentile(durations, 0.95), P99Microseconds: percentile(durations, 0.99),

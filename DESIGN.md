@@ -1,76 +1,85 @@
 # LedgerDB storage design
 
-## Directory ownership
+## Directory ownership and versions
 
-`Open` durably creates missing directory components and then acquires an
-exclusive advisory lock on `LOCK` before checkpoint loading, WAL replay, or tail
-repair. The lock remains held until `Close`. This prevents two writers from
-assigning the same LSN or one opener from truncating another writer's partial
-append.
+`Open` durably creates missing directory components and acquires an exclusive
+advisory `LOCK` before checkpoint load, replay, or repair. The lock lasts until
+`Close`. One process owns the directory; there is no replication.
 
-## Commit protocol
+Readers accept WAL envelopes, checkpoints, and manifests with versions 1 and 2.
+New writes use v2. Legacy account states imply zero reservations. Old binaries
+reject v2; downgrade after a write or checkpoint is unsupported.
 
-Mutations reserve their idempotency key, lock affected account shards in stable
-order, validate against current balances, and enter the global WAL sequencer.
-The sequencer assigns the next LSN, appends one complete record, and synchronizes
-the WAL. Only then are balances and the completion record published in memory.
+## Commit coordinator
 
-The sequencer is held through publication. This makes a checkpoint's captured
-base LSN a barrier: every mutation at or below that LSN is present in both the
-account state and idempotency index before checkpoint copying starts.
+Mutation callers validate request shape, reserve an idempotency key, and enter a
+bounded queue (1,024). Matching duplicates rendezvous on the key owner. No caller
+holds account locks while waiting. The coordinator collects up to the configured
+batch size within its delay; default size one preserves individual synchronization.
+
+The coordinator identifies affected account shards, locks them in ascending
+order, then locks hold state and the commit barrier. Operations validate in queue
+order against staged account/hold overlays. Invalid operations do not change the
+overlay or consume an LSN. Valid operations get one LSN and one record each.
+
+All records are encoded before writing. Each touched WAL segment is synchronized;
+rotation synchronizes the preceding dirty segment before closing it and creates
+and directory-syncs the next. Only after all barriers succeed are account state,
+holds, idempotency results, and success responses published. The commit barrier
+is held through publication. A batch is not an atomic transaction: crash recovery
+may retain a prefix, and callers resolve uncertain outcomes by retrying keys.
+
+WAL write/sync failure discards staged state, poisons the handle, and wakes batch
+and queued callers. No in-process retry is attempted. Cancellation before
+processing releases the key and prevents execution; after processing starts the
+owner waits for the real outcome. `Close` stops admission, stops/joins background
+checkpointing, drains accepted operations, joins the coordinator, then closes
+storage and releases directory ownership.
+
+## Payment state
+
+An account's total balance includes reserved funds. Available funds equal total
+minus reserved; ordinary transfers validate availability. Holds move once from
+reserved to settled/cancelled. Settlement transfers the actual amount and releases
+the entire reservation, atomically with the hold transition and retry result.
+Terminal results persist with holds indefinitely. A terminal retry under a new
+key appends an idempotency alias without changing financial state, returning the
+original terminal LSN/result. Key expiry does not permit hold reuse.
 
 ## WAL format
 
-WAL files are named `wal-%020d.log` and rotate at 64 MiB by default. Each record
-has a 16-byte binary envelope followed by JSON payload:
+Segments are `wal-%020d.log` and rotate at 64 MiB by default. Records have a
+16-byte envelope: magic `LDBW` (4 bytes), little-endian version (2), zero flags
+(2), payload length (4), CRC32 of payload (4), followed by JSON.
 
-| Field | Size | Meaning |
-| --- | ---: | --- |
-| Magic | 4 bytes | `LDBW` |
-| Version | 2 bytes | Format version 1 |
-| Flags | 2 bytes | Reserved, currently zero |
-| Payload length | 4 bytes | Little-endian byte count |
-| CRC32 | 4 bytes | Checksum of the payload |
-| Payload | Variable | Record type, LSN, timestamp, key, fingerprint, request, result |
+The JSON contains operation type, LSN, timestamp, key, fingerprint, request,
+response, and (for coordinator records) affected post-operation account/hold
+snapshots. Payloads are capped at 1 MiB before allocation. LSNs must increase in
+replay order. Each object applies only records newer than its own LSN.
 
-Segment creation and deletion synchronize the database directory. Every append
-handles short writes and synchronizes the active segment before success.
-Record payloads are capped at 1 MiB before allocation. Segment filenames must
-use the canonical zero-padded form.
+## Fuzzy checkpoints and maintenance
 
-## Fuzzy checkpoints
+Checkpoint capture reads a committed base LSN under the commit barrier, then
+copies accounts, holds, and completed keys independently. Immutable terminal
+responses can be shared during copying; live mutations replace values. Recovery
+replays records after the base, skipping already-newer objects. After full replay,
+account reservations must match active holds and terminal results must agree.
 
-A checkpoint records the current committed LSN and then copies account and
-idempotency shards independently. Every copied object includes its last LSN, so
-the image may safely contain updates newer than the checkpoint base. Recovery
-replays every WAL record after the base and applies it only to objects whose LSN
-is older than the record.
+Checkpoint and manifest envelopes have length and CRC fields. Each is published
+by temp-file write, sync, rename, and directory sync; covered inactive WAL segments
+are removed only after manifest publication. An orphan valid checkpoint can be
+used when no manifest exists, because compaction cannot yet have occurred.
 
-Checkpoint and manifest files use length-and-CRC envelopes. Each is written to a
-temporary file, synchronized, renamed, and followed by a directory sync. WAL
-segments ending at or before the base are removed only after the manifest is
-durable. An orphaned valid checkpoint is safe to discover after a crash.
-
-Expired completion records are deleted from live idempotency shards
-incrementally during commits and eagerly during checkpoint copying. This makes
-the configured lease a memory-retention bound as well as an on-disk compaction
-rule.
+Expired completed keys are pruned incrementally during commits and eagerly during
+checkpointing. Holds are never pruned. Optional interval/operation triggers run
+one background checkpointer; failure is observable and retried on a later trigger.
+Stats counters are process-local except recovered/live LSN, key, and hold counts.
 
 ## Failure model
 
-LedgerDB repairs physically incomplete final records. A complete record with an
-invalid header, version, length, or checksum fails closed, even at the WAL tail.
-It does not repair latent sector errors,
-silent corruption of previously durable data, or hardware that acknowledges but
-does not honor sync. A sync error is never retried in-process because operating
-systems may discard dirty-page state after reporting the error.
-
-The `internal/failpoint` filesystem can fail or shorten opens, writes, syncs,
-truncates, closes, renames, removes, directory reads, and file reads. Tests use
-it to explore bounded crash points and automatically check balance and
-idempotency invariants after recovery.
-
-The integration suite also runs mutations in a child process and exits abruptly
-immediately before and after WAL write and sync operations. This validates
-process-crash recovery; qualifying true power-loss behavior still requires the
-target filesystem and device stack.
+Physically incomplete final records are truncated and synchronized. Complete
+records with bad headers/checksums or inconsistent recovered state fail closed.
+CRC32 detects corruption; it cannot repair it or resist malicious modification.
+Process crashes and injected I/O failures are tested, including shared-sync
+batches and payment transitions. Power-loss qualification remains dependent on
+the target filesystem, firmware, hardware, and synchronization semantics.
